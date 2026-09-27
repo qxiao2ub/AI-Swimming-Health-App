@@ -42,7 +42,7 @@ def _secret_value(secrets: Mapping[str, Any] | None, key: str) -> str | None:
 def _increment_supabase(
     secrets: Mapping[str, Any],
     app_slug: str,
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 1.5,
 ) -> int:
     base_url = _secret_value(secrets, "SUPABASE_URL")
     api_key = _secret_value(secrets, "SUPABASE_ANON_KEY")
