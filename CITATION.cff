@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+title: "AI Swimming Health App"
+message: "Please cite this software and acknowledge both the student author and mentor."
+type: software
+authors:
+  - family-names: Sun
+    given-names: Kevin
+  - family-names: Xiao
+    given-names: Qingyang
+    name-suffix: Ph.D.
+version: 1.0.0
+date-released: 2026-09-22
+license: MIT
+abstract: "A Streamlit-ready educational AI application for smartwatch swimming-signal analysis, stroke classification, health visualization, and safety-constrained coaching guidance."
