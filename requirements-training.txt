@@ -1,0 +1,5 @@
+# OPTIONAL developer machine / Colab dependencies; never installed by Streamlit Cloud.
+-r requirements.txt
+scikit-learn>=1.7,<2
+joblib>=1.5,<2
+torch>=2.7,<3

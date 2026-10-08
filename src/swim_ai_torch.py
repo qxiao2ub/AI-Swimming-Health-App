@@ -2,7 +2,7 @@
 
 This module adapts the attached Google Colab notebook into reusable functions
 for Streamlit deployment. It keeps the notebook's smartwatch ingestion,
-signal cleaning, feature engineering, original three-model ensemble (exported for NumPy-only inference), health summary,
+signal cleaning, feature engineering, three-model ensemble, health summary,
 and safety-constrained reinforcement-learning recommendation.
 
 Author: Kevin Sun
@@ -22,12 +22,14 @@ import os
 import random
 import warnings
 
+import joblib
 import numpy as np
 import pandas as pd
-
-from .portable_models import PortableModelBundle, load_portable_models
-
-ModelBundle = PortableModelBundle
+import torch
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -59,6 +61,24 @@ class AthleteProfile:
     mass_kg: float = 65.0
     resting_hr_bpm: float = 60.0
     pool_length_m: float = 25.0
+
+
+@dataclass
+class ModelBundle:
+    """Loaded model and preprocessing artifacts for fast Streamlit inference."""
+
+    rf_model: RandomForestClassifier
+    feature_scaler: StandardScaler
+    feature_dnn: nn.Module
+    sequence_model: nn.Module
+    sequence_mean: np.ndarray
+    sequence_std: np.ndarray
+    class_names: list[str]
+    ensemble_weights: np.ndarray
+    feature_columns: list[str]
+    q_table: np.ndarray
+    model_metrics: dict[str, Any]
+    training_source: str
 
 
 @dataclass
@@ -169,9 +189,21 @@ ACTION_TEXT = {
 
 
 def seed_everything(seed: int = 42) -> None:
-    """Seed NumPy and Python without importing the training libraries."""
+    """Make model training and synthetic demonstrations reproducible."""
+
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+    try:
+        torch.set_num_threads(min(4, os.cpu_count() or 2))
+    except Exception:
+        pass
 
 
 def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
@@ -437,18 +469,10 @@ def clean_watch_data(df: pd.DataFrame, config: AppConfig = DEFAULT_CONFIG) -> pd
         if optional not in clean:
             clean[optional] = np.nan
 
-    clean["timestamp"] = pd.to_datetime(clean["timestamp"], errors="coerce", format="mixed", utc=True)
+    clean["timestamp"] = pd.to_datetime(clean["timestamp"], errors="coerce", utc=False)
     clean = clean.dropna(subset=["timestamp"]).copy()
     if clean.empty:
         raise ValueError("No valid timestamps remained after parsing the uploaded data.")
-    if len(clean) > 180_000:
-        raise ValueError("This hosted demo accepts at most 180,000 raw sensor records per upload. Split longer recordings into sessions.")
-    if clean["session_id"].nunique() > 30:
-        raise ValueError("For resource safety, upload at most 30 sessions per file.")
-    # Prevent multi-day timestamp errors expanding to hundreds of millions of samples.
-    durations = clean.groupby("session_id")["timestamp"].agg(["min", "max"])
-    if ((durations["max"] - durations["min"]) > pd.Timedelta(hours=2)).any():
-        raise ValueError("One session spans more than 2 hours. Split the data into smaller session IDs or verify timestamps.")
 
     clean["athlete_id"] = clean["athlete_id"].astype(str)
     clean["session_id"] = clean["session_id"].astype(str)
@@ -701,19 +725,154 @@ def build_window_bundle(
     }
 
 
-def load_model_bundle(model_directory: str | Path) -> PortableModelBundle:
-    """Load the original three trained AI models, exported to lightweight NumPy."""
-    return load_portable_models(model_directory)
+class FeatureDNN(nn.Module):
+    """Dense neural network architecture retained from the source notebook."""
+
+    def __init__(self, n_features: int, n_classes: int):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(n_features, 160),
+            nn.BatchNorm1d(160),
+            nn.ReLU(),
+            nn.Dropout(0.22),
+            nn.Linear(160, 96),
+            nn.BatchNorm1d(96),
+            nn.ReLU(),
+            nn.Dropout(0.18),
+            nn.Linear(96, 48),
+            nn.ReLU(),
+            nn.Linear(48, n_classes),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
 
 
-def infer_bundle(bundle: dict[str, Any], models: PortableModelBundle) -> tuple[np.ndarray, np.ndarray]:
-    """Classify all windows using the original RF + DNN + CNN/BiGRU ensemble."""
-    feature_matrix = bundle["features"].reindex(
-        columns=models.feature_columns, fill_value=0.0
-    ).to_numpy(dtype=np.float32)
-    per_model = models.predict_probabilities(feature_matrix, bundle["sequences"])
-    combined = per_model["ensemble"]
-    return combined.argmax(axis=1), combined
+class CNNBiGRU(nn.Module):
+    """1D convolution plus bidirectional GRU sequence classifier."""
+
+    def __init__(self, n_channels: int, n_classes: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.12),
+        )
+        self.gru = nn.GRU(
+            input_size=64,
+            hidden_size=36,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(72, 48),
+            nn.ReLU(),
+            nn.Dropout(0.18),
+            nn.Linear(48, n_classes),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        transformed = inputs.transpose(1, 2)
+        transformed = self.conv(transformed)
+        transformed = transformed.transpose(1, 2)
+        transformed, _ = self.gru(transformed)
+        transformed = transformed.mean(dim=1)
+        return self.head(transformed)
+
+
+def _load_torch_state(path: Path) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def load_model_bundle(model_directory: str | Path) -> ModelBundle:
+    """Load the included pretrained artifacts without retraining in Streamlit."""
+
+    model_directory = Path(model_directory)
+    metadata_path = model_directory / "model_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Missing model artifacts in {model_directory}. Run scripts/train_models.py first."
+        )
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    class_names = [str(value) for value in metadata["class_names"]]
+    feature_columns = [str(value) for value in metadata["feature_columns"]]
+
+    feature_dnn = FeatureDNN(len(feature_columns), len(class_names))
+    feature_dnn.load_state_dict(_load_torch_state(model_directory / "feature_dnn_state.pt"))
+    feature_dnn.eval()
+
+    sequence_model = CNNBiGRU(len(SEQUENCE_CHANNELS), len(class_names))
+    sequence_model.load_state_dict(_load_torch_state(model_directory / "cnn_bigru_state.pt"))
+    sequence_model.eval()
+
+    return ModelBundle(
+        rf_model=joblib.load(model_directory / "random_forest.joblib"),
+        feature_scaler=joblib.load(model_directory / "feature_scaler.joblib"),
+        feature_dnn=feature_dnn,
+        sequence_model=sequence_model,
+        sequence_mean=np.asarray(metadata["sequence_mean"], dtype=np.float32).reshape(
+            1, 1, len(SEQUENCE_CHANNELS)
+        ),
+        sequence_std=np.asarray(metadata["sequence_std"], dtype=np.float32).reshape(
+            1, 1, len(SEQUENCE_CHANNELS)
+        ),
+        class_names=class_names,
+        ensemble_weights=np.asarray(metadata["ensemble_weights"], dtype=float),
+        feature_columns=feature_columns,
+        q_table=np.load(model_directory / "rl_q_table.npy"),
+        model_metrics=metadata.get("model_metrics", {}),
+        training_source=str(metadata.get("training_source", "structured synthetic watch data")),
+    )
+
+
+def predict_probabilities(model: nn.Module, inputs: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    model.eval()
+    loader = DataLoader(
+        TensorDataset(torch.tensor(inputs, dtype=torch.float32)),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    probabilities: list[np.ndarray] = []
+    with torch.inference_mode():
+        for (batch,) in loader:
+            logits = model(batch)
+            probabilities.append(torch.softmax(logits, dim=1).cpu().numpy())
+    return np.vstack(probabilities)
+
+
+def infer_bundle(bundle: dict[str, Any], models: ModelBundle) -> tuple[np.ndarray, np.ndarray]:
+    feature_matrix = (
+        bundle["features"]
+        .reindex(columns=models.feature_columns, fill_value=0.0)
+        .to_numpy(dtype=np.float32)
+    )
+    sequence_matrix = bundle["sequences"].astype(np.float32)
+
+    rf_probabilities = models.rf_model.predict_proba(feature_matrix)
+    scaled_features = models.feature_scaler.transform(feature_matrix).astype(np.float32)
+    dnn_probabilities = predict_probabilities(models.feature_dnn, scaled_features)
+    normalized_sequences = (
+        (sequence_matrix - models.sequence_mean) / models.sequence_std
+    ).astype(np.float32)
+    sequence_probabilities = predict_probabilities(models.sequence_model, normalized_sequences)
+
+    combined = (
+        models.ensemble_weights[0] * rf_probabilities
+        + models.ensemble_weights[1] * dnn_probabilities
+        + models.ensemble_weights[2] * sequence_probabilities
+    )
+    predictions = combined.argmax(axis=1)
+    return predictions, combined
 
 
 def estimated_max_hr(age_years: int) -> float:

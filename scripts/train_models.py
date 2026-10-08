@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, TensorDataset
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.swim_ai import (  # noqa: E402
+from src.swim_ai_torch import (  # noqa: E402
     DEFAULT_CONFIG,
     FeatureDNN,
     CNNBiGRU,

@@ -1,13 +1,9 @@
-# Project Credits
+# AquaMind — AI Swimming Health App
 
-## Author / Student
+**Student author and project creator:** Kevin Sun (junior student)
 
-**Kevin Sun**
+**Mentor and research advisor:** Dr. Qingyang Xiao
 
-Kevin Sun conceived and developed the AI Swimming Health App project, including the smartwatch data concept, swimming-health use case, and product direction.
+Original: AI-based swimming-health Google Colab notebook, converted into a Streamlit Community Cloud application with NumPy-only inference for the same trained models.
 
-## Mentor
-
-**Dr. Qingyang Xiao**
-
-Dr. Qingyang Xiao advised the project architecture, AI/ML methodology, analytics design, product development, and deployment workflow.
+Educational research prototype; not a clinical health device.

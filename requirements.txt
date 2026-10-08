@@ -1,7 +1,9 @@
-streamlit==1.64.0
-numpy==2.3.5
-pandas==2.2.3
-scikit-learn==1.8.0
-plotly==6.5.2
-torch==2.10.0
-joblib==1.5.3
+# Streamlit Cloud ONLY: no PyTorch, scikit-learn, SciPy, joblib, or ffmpeg.
+# Python 3.13/3.14 wheels; avoid pandas 2.2.3 on Python 3.14.
+streamlit>=1.60,<2
+numpy>=2.3.3,<3
+pandas>=2.3.3,<3
+plotly>=6.3,<7
+pillow>=11.3,<13
+# Streamlit needs Arrow; v22+ supplies Python 3.14 wheels.
+pyarrow>=22,<26
